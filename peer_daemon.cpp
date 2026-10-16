@@ -22,6 +22,8 @@
 #include <unistd.h>
 #include <vector>
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <thread>
 
 // =============================================================================
@@ -39,6 +41,11 @@ struct PeerInfo {
     bool has_blake2b;
     bool has_rdts;
     bool banned;
+    bool is_keep;
+    bool is_inject;
+    uint32_t first_responder_count;
+    uint32_t connected_seconds;
+    float score_per_100;
 };
 
 struct NodeState {
@@ -105,9 +112,112 @@ static void start_scanners() {
         scanner_threads.emplace_back(scanner_thread, NODES[i], (int)i, gen);
 }
 
+static const int SCAN_INTERVAL_SEC = 8;
+
+// Persistent peer tracking (across scans)
+struct PeerTrack {
+    uint32_t first_responder_count = 0;
+    uint32_t connected_seconds = 0;
+    uint32_t last_seen_scan = 0;
+    uint32_t last_block_announcement = 0;
+    std::string latest_json;   // most recent getpeerinfo object for this peer
+    std::string last_addr;
+};
+static std::map<std::string, PeerTrack> peer_registry;
+static std::mutex registry_mutex;
+static uint32_t scan_counter = 0;
+static const char* PEER_DB = "peers.db";
+
+static void load_peer_db() {
+    std::ifstream f(PEER_DB);
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        // format: ip|first_resp|conn_sec|last_ann|last_addr
+        size_t p1 = line.find('|');
+        if (p1 == std::string::npos) continue;
+        size_t p2 = line.find('|', p1+1);
+        size_t p3 = line.find('|', p2+1);
+        size_t p4 = line.find('|', p3+1);
+        if (p2 == std::string::npos || p3 == std::string::npos) continue;
+        std::string ip = line.substr(0, p1);
+        PeerTrack t;
+        t.first_responder_count = std::atoi(line.c_str() + p1 + 1);
+        t.connected_seconds = std::atoi(line.c_str() + p2 + 1);
+        t.last_block_announcement = std::atoi(line.c_str() + p3 + 1);
+        if (p4 != std::string::npos) t.last_addr = line.substr(p4 + 1);
+        peer_registry[ip] = t;
+    }
+}
+
+static void save_peer_db() {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    std::ofstream f(PEER_DB, std::ios::trunc);
+    if (!f) return;
+    f << "# ip|first_resp|conn_sec|last_announcement|last_addr\n";
+    for (const auto& [ip, t] : peer_registry) {
+        f << ip << '|' << t.first_responder_count << '|' << t.connected_seconds
+          << '|' << t.last_block_announcement << '|' << t.last_addr << '\n';
+    }
+}
+
+static void update_tracking(std::vector<PeerInfo>& peers, const std::string& raw_json) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    scan_counter++;
+    for (auto& p : peers) {
+        auto& t = peer_registry[p.ip];
+        t.connected_seconds += SCAN_INTERVAL_SEC;
+        t.last_seen_scan = scan_counter;
+        t.last_addr = p.addr;
+        size_t pos = raw_json.find(std::string("\"addr\":\"") + p.addr);
+        if (pos != std::string::npos) {
+            // extract the peer object roughly
+            size_t obj_start = raw_json.rfind('{', pos);
+            size_t obj_end = raw_json.find('}', pos);
+            if (obj_start != std::string::npos && obj_end != std::string::npos && obj_end > obj_start)
+                t.latest_json = raw_json.substr(obj_start, obj_end - obj_start + 1);
+            size_t ann = raw_json.find("\"last_block_announcement\"", pos);
+            if (ann != std::string::npos && ann < pos + 2000) {
+                size_t colon = raw_json.find(':', ann);
+                if (colon != std::string::npos) {
+                    uint32_t ts = std::atoi(raw_json.c_str() + colon + 1);
+                    if (ts > t.last_block_announcement && ts > 0) {
+                        t.first_responder_count++;
+                        t.last_block_announcement = ts;
+                    }
+                }
+            }
+        }
+        p.first_responder_count = t.first_responder_count;
+        p.connected_seconds = t.connected_seconds;
+        float blocks_seen = std::max(1.0f, t.connected_seconds / 600.0f);
+        p.score_per_100 = (t.first_responder_count * 100.0f) / blocks_seen;
+    }
+}
+
+static void write_csv() {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    std::vector<std::pair<std::string, PeerTrack>> sorted(peer_registry.begin(), peer_registry.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        float ba = std::max(1.0f, a.second.connected_seconds / 600.0f);
+        float bb = std::max(1.0f, b.second.connected_seconds / 600.0f);
+        float sa = (a.second.first_responder_count * 100.0f) / ba;
+        float sb = (b.second.first_responder_count * 100.0f) / bb;
+        return sa > sb;
+    });
+    std::ofstream f("peers_seen.csv");
+    if (!f) return;
+    f << "addr,score_per_100\n";
+    for (const auto& [ip, t] : sorted) {
+        float blocks = std::max(1.0f, t.connected_seconds / 600.0f);
+        float score = (t.first_responder_count * 100.0f) / blocks;
+        f << ip << " # score=" << score << " first_resp=" << t.first_responder_count
+          << " conn_sec=" << t.connected_seconds << "\n";
+    }
+}
 static const char* BLAKE2B_FLAG = "BLAKE2B?";
 static const char* RDTS_FLAG    = "REDUCED_DATA?";
-static const int SCAN_INTERVAL_SEC = 8;
 static const int BAN_SECONDS = 86400 * 7;
 
 // =============================================================================
@@ -415,7 +525,7 @@ static std::vector<PeerInfo> parse_peers(const std::string& json) {
 
         // servicesnames must appear soon after this addr
         size_t sn = json.find("\"servicesnames\"", pos);
-        if (sn != std::string::npos && sn < pos + 1200) {
+        if (sn != std::string::npos && sn < pos + 4000) {
             size_t arr = json.find('[', sn);
             size_t endarr = json.find(']', arr);
             if (arr != std::string::npos && endarr != std::string::npos) {
@@ -509,7 +619,16 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
                 if (c != std::string::npos) kip = kip.substr(0, c);
                 if (std::string(p.ip) == kip) { is_keep = true; break; }
             }
-            if (is_keep) continue;
+            bool is_inject = false;
+            for (const auto& inj : cfg.inject_peers) {
+                std::string iip = inj;
+                auto c = iip.rfind(':');
+                if (c != std::string::npos) iip = iip.substr(0, c);
+                if (std::string(p.ip) == iip) { is_inject = true; break; }
+            }
+            p.is_keep = is_keep;
+            p.is_inject = is_inject;
+            if (is_keep || is_inject) continue;
 
             bool should_ban = false;
             if (cfg.enforce_blake2b && !p.has_blake2b) should_ban = true;
@@ -522,6 +641,9 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
             }
         }
         ensure_keep_and_inject(cfg);
+
+        update_tracking(peers, peer_resp);
+        if (scan_counter % 10 == 0) write_csv();
 
         pthread_mutex_lock(&shm->mutex);
         NodeState& st = shm->nodes[node_idx];
@@ -616,6 +738,14 @@ int main(int argc, char** argv) {
     shm->config_error[0] = '\0';
     strncpy(shm->config_path, cfg_path.c_str(), sizeof(shm->config_path)-1);
     load_dry_run();
+    load_peer_db();
+
+    std::thread db_saver([] {
+        while (running.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            if (running.load()) save_peer_db();
+        }
+    });
 
     std::vector<std::thread> threads;
     start_scanners();
@@ -635,7 +765,9 @@ int main(int argc, char** argv) {
     running.store(false);
     shm->daemon_running.store(false);
     save_dry_run();
+    save_peer_db();
     for (auto& t : scanner_threads) if (t.joinable()) t.join();
+    if (db_saver.joinable()) db_saver.join();
     if (watcher.joinable()) watcher.join();
 
     munmap(shm, sizeof(SharedState));
