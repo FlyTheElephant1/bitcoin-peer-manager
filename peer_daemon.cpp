@@ -1,0 +1,643 @@
+// peer_daemon.cpp
+// Background scanner/enforcer. Loads nodes from config.json.
+// Writes shared memory. Display attaches separately.
+//
+// Build: g++ -std=c++17 -pthread -O2 -o peer_daemon peer_daemon.cpp -lrt
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <vector>
+#include <algorithm>
+#include <thread>
+
+// =============================================================================
+// Shared memory layout
+// =============================================================================
+static const int MAX_PEERS_PER_NODE = 128;
+static const int MAX_NODES = 32;
+static const char* SHM_NAME = "/bitcoin_peer_scanner_shm";
+static const char* STATE_FILE = "dry_run.state";
+static const char* CONFIG_FILE = "config.json";
+
+struct PeerInfo {
+    char addr[64];
+    char ip[46];
+    bool has_blake2b;
+    bool has_rdts;
+    bool banned;
+};
+
+struct NodeState {
+    char name[32];
+    PeerInfo peers[MAX_PEERS_PER_NODE];
+    int peer_count;
+    int banned_count;
+    char last_error[64];
+};
+
+struct SharedState {
+    pthread_mutex_t mutex;
+    std::atomic<bool> dry_run;
+    std::atomic<bool> parse_mismatch;
+    std::atomic<bool> daemon_running;
+    std::atomic<uint32_t> fidget;   // incremented every second by daemon
+    int node_count;
+    NodeState nodes[MAX_NODES];
+    char config_error[128];
+    char config_path[256];
+};
+
+// =============================================================================
+// Config
+// =============================================================================
+struct NodeConfig {
+    std::string name;
+    std::string host;
+    int port = 8332;
+    std::string rpcuser;
+    std::string rpcpassword;
+    std::string cookie_path;
+    std::vector<std::string> keep_peers;   // "ip:port" or "ip" (defaults to :8333)
+    std::vector<std::string> inject_peers; // always addnode these
+    bool enforce_blake2b = false;
+    bool enforce_bip110 = false;
+};
+
+static std::vector<NodeConfig> NODES;
+static SharedState* shm = nullptr;
+static std::atomic<bool> running{true};
+static std::vector<std::thread> scanner_threads;
+static std::atomic<int> config_generation{0};
+
+// forward declaration
+static void scanner_thread(NodeConfig cfg, int node_idx, int gen);
+
+static std::atomic<int> scanner_generation{0};
+
+static void stop_scanners() {
+    // Bump generation so old threads exit on their next check.
+    // Detach them so we never join a thread that may already be gone.
+    scanner_generation.fetch_add(1);
+    for (auto& t : scanner_threads) {
+        if (t.joinable()) t.detach();
+    }
+    scanner_threads.clear();
+}
+
+static void start_scanners() {
+    stop_scanners();
+    int gen = scanner_generation.load();
+    for (size_t i = 0; i < NODES.size(); ++i)
+        scanner_threads.emplace_back(scanner_thread, NODES[i], (int)i, gen);
+}
+
+static const char* BLAKE2B_FLAG = "BLAKE2B?";
+static const char* RDTS_FLAG    = "REDUCED_DATA?";
+static const int SCAN_INTERVAL_SEC = 8;
+static const int BAN_SECONDS = 86400 * 7;
+
+// =============================================================================
+// Minimal JSON config loader
+// =============================================================================
+static std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+}
+
+static std::string extract_string(const std::string& obj, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = obj.find(needle);
+    if (pos == std::string::npos) return "";
+    pos = obj.find(':', pos);
+    if (pos == std::string::npos) return "";
+    pos = obj.find('"', pos);
+    if (pos == std::string::npos) return "";
+    size_t end = obj.find('"', pos + 1);
+    if (end == std::string::npos) return "";
+    return obj.substr(pos + 1, end - pos - 1);
+}
+
+static int extract_int(const std::string& obj, const std::string& key, int def = 0) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = obj.find(needle);
+    if (pos == std::string::npos) return def;
+    pos = obj.find(':', pos);
+    if (pos == std::string::npos) return def;
+    pos++;
+    while (pos < obj.size() && (obj[pos] == ' ' || obj[pos] == '\t')) pos++;
+    return std::atoi(obj.c_str() + pos);
+}
+
+static bool extract_bool(const std::string& obj, const std::string& key, bool def = false) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = obj.find(needle);
+    if (pos == std::string::npos) return def;
+    pos = obj.find(':', pos);
+    if (pos == std::string::npos) return def;
+    pos++;
+    while (pos < obj.size() && (obj[pos] == ' ' || obj[pos] == '\t')) pos++;
+    return obj.compare(pos, 4, "true") == 0;
+}
+
+static std::vector<std::string> extract_string_array(const std::string& obj, const std::string& key) {
+    std::vector<std::string> out;
+    std::string needle = "\"" + key + "\"";
+    size_t pos = obj.find(needle);
+    if (pos == std::string::npos) return out;
+    size_t arr = obj.find('[', pos);
+    if (arr == std::string::npos) return out;
+    size_t end = obj.find(']', arr);
+    if (end == std::string::npos) return out;
+    std::string inside = obj.substr(arr + 1, end - arr - 1);
+    size_t p = 0;
+    while ((p = inside.find('"', p)) != std::string::npos) {
+        size_t q = inside.find('"', p + 1);
+        if (q == std::string::npos) break;
+        std::string s = inside.substr(p + 1, q - p - 1);
+        if (!s.empty()) out.push_back(s);
+        p = q + 1;
+    }
+    return out;
+}
+
+static bool load_config(const std::string& path, std::string& error_out) {
+    error_out.clear();
+    std::ifstream f(path);
+    if (!f) {
+        error_out = "Cannot open config file";
+        return false;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string json = ss.str();
+
+    if (json.find('{') == std::string::npos) {
+        error_out = "Not valid JSON (no object)";
+        return false;
+    }
+
+    size_t nodes_pos = json.find("\"nodes\"");
+    if (nodes_pos == std::string::npos) {
+        error_out = "Missing \"nodes\" array";
+        return false;
+    }
+    size_t arr_start = json.find('[', nodes_pos);
+    if (arr_start == std::string::npos) {
+        error_out = "Malformed nodes array";
+        return false;
+    }
+    // find matching ] for the nodes array
+    int arr_depth = 0;
+    size_t arr_end = arr_start;
+    bool in_str = false;
+    for (; arr_end < json.size(); ++arr_end) {
+        char c = json[arr_end];
+        if (c == '"' && (arr_end == 0 || json[arr_end-1] != '\\')) in_str = !in_str;
+        if (in_str) continue;
+        if (c == '[') arr_depth++;
+        else if (c == ']') {
+            arr_depth--;
+            if (arr_depth == 0) break;
+        }
+    }
+    if (arr_end >= json.size() || arr_depth != 0) {
+        error_out = "Unclosed nodes array";
+        return false;
+    }
+
+    std::string arr = json.substr(arr_start + 1, arr_end - arr_start - 1);
+    size_t pos = 0;
+    std::vector<NodeConfig> new_nodes;
+    while ((pos = arr.find('{', pos)) != std::string::npos) {
+        // match braces, ignoring strings
+        int depth = 0;
+        size_t end = pos;
+        bool in_str = false;
+        for (; end < arr.size(); ++end) {
+            char c = arr[end];
+            if (c == '"' && (end == 0 || arr[end-1] != '\\')) in_str = !in_str;
+            if (in_str) continue;
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) break;
+            }
+        }
+        if (end >= arr.size() || depth != 0) {
+            error_out = "Unclosed object in nodes array";
+            return false;
+        }
+        std::string obj = arr.substr(pos, end - pos + 1);
+
+        NodeConfig n;
+        n.name = extract_string(obj, "name");
+        n.host = extract_string(obj, "host");
+        n.port = extract_int(obj, "port", 8332);
+        n.rpcuser = extract_string(obj, "rpcuser");
+        n.rpcpassword = extract_string(obj, "rpcpassword");
+        n.cookie_path = extract_string(obj, "cookie_path");
+        n.keep_peers = extract_string_array(obj, "keep_peers");
+        n.inject_peers = extract_string_array(obj, "inject_peers");
+        // backward compat: single keep_ip
+        std::string single = extract_string(obj, "keep_ip");
+        if (!single.empty()) n.keep_peers.push_back(single);
+        n.enforce_blake2b = extract_bool(obj, "enforce_blake2b");
+        n.enforce_bip110 = extract_bool(obj, "enforce_bip110");
+
+        if (n.name.empty() || n.host.empty()) {
+            error_out = "Node missing name or host";
+            return false;
+        }
+        if (n.port < 1 || n.port > 65535) {
+            error_out = "Invalid port on node " + n.name;
+            return false;
+        }
+
+        new_nodes.push_back(n);
+        pos = end + 1;
+        if (new_nodes.size() >= MAX_NODES) break;
+    }
+
+    if (new_nodes.empty()) {
+        error_out = "No valid nodes found";
+        return false;
+    }
+
+    NODES = std::move(new_nodes);
+    return true;
+}
+
+// =============================================================================
+// Dry-run file helpers
+// =============================================================================
+static void load_dry_run() {
+    std::ifstream f(STATE_FILE);
+    if (!f) {
+        shm->dry_run.store(true);
+        return;
+    }
+    int v = 1;
+    f >> v;
+    shm->dry_run.store(v != 0);
+}
+
+static void save_dry_run() {
+    std::ofstream f(STATE_FILE, std::ios::trunc);
+    if (f) f << (shm->dry_run.load() ? 1 : 0) << "\n";
+}
+
+// =============================================================================
+// Minimal HTTP + JSON-RPC
+// =============================================================================
+static std::string read_cookie(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return "";
+    char buf[256] = {};
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return ""; }
+    fclose(f);
+    std::string s(buf);
+    while (!s.empty() && (s.back()=='\n' || s.back()=='\r')) s.pop_back();
+    return s;
+}
+
+static std::string base64_encode(const std::string& in) {
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, valb = -6;
+    for (unsigned char c : in) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(tbl[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+static std::string http_post(const std::string& host, int port,
+                              const std::string& auth_header,
+                              const std::string& body) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return "";
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(sock); return "";
+    }
+
+    std::ostringstream req;
+    req << "POST / HTTP/1.1\r\nHost: " << host << "\r\n"
+        << "Content-Type: application/json\r\nContent-Length: " << body.size() << "\r\n"
+        << "Authorization: " << auth_header << "\r\nConnection: close\r\n\r\n" << body;
+
+    std::string r = req.str();
+    send(sock, r.data(), r.size(), 0);
+
+    std::string resp;
+    char buf[4096];
+    while (true) {
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        resp.append(buf, n);
+    }
+    close(sock);
+    auto pos = resp.find("\r\n\r\n");
+    return pos == std::string::npos ? "" : resp.substr(pos + 4);
+}
+
+static std::vector<PeerInfo> parse_peers(const std::string& json) {
+    std::vector<PeerInfo> out;
+    size_t pos = 0;
+    // Look for peer-level "addr" fields. Real peer addrs contain ':' or '.' or are onion/i2p.
+    // Skip anything that looks like a message-type key (feefilter, alert, getaddr, block, etc.)
+    while ((pos = json.find("\"addr\"", pos)) != std::string::npos && out.size() < MAX_PEERS_PER_NODE) {
+        // Make sure this is a key, not a substring
+        if (pos > 0 && json[pos-1] != '{' && json[pos-1] != ',' && json[pos-1] != ' ' && json[pos-1] != '\n') {
+            pos += 6;
+            continue;
+        }
+        size_t colon = json.find(':', pos);
+        if (colon == std::string::npos) break;
+        size_t q1 = json.find('"', colon);
+        if (q1 == std::string::npos) break;
+        size_t q2 = json.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+
+        std::string addr = json.substr(q1 + 1, q2 - q1 - 1);
+
+        // Filter out non-address strings
+        bool looks_like_addr = false;
+        if (addr.find(':') != std::string::npos) looks_like_addr = true;          // ip:port or [ipv6]:port
+        else if (addr.find('.') != std::string::npos) looks_like_addr = true;     // hostname
+        else if (addr.size() > 16 && addr.find("onion") != std::string::npos) looks_like_addr = true;
+        else if (addr.size() > 16 && addr.find("i2p") != std::string::npos) looks_like_addr = true;
+
+        if (!looks_like_addr || addr == "addr" || addr.find("feefilter") != std::string::npos ||
+            addr.find("alert") != std::string::npos || addr.find("getaddr") != std::string::npos ||
+            addr.find("block") != std::string::npos || addr.find("cmpctblock") != std::string::npos) {
+            pos = q2 + 1;
+            continue;
+        }
+
+        PeerInfo p{};
+        strncpy(p.addr, addr.c_str(), sizeof(p.addr)-1);
+        std::string ip = addr;
+        auto c = ip.rfind(':');
+        if (c != std::string::npos) {
+            if (ip[0] == '[') {
+                auto end = ip.find(']');
+                if (end != std::string::npos) ip = ip.substr(1, end - 1);
+            } else {
+                ip = ip.substr(0, c);
+            }
+        }
+        strncpy(p.ip, ip.c_str(), sizeof(p.ip)-1);
+
+        // servicesnames must appear soon after this addr
+        size_t sn = json.find("\"servicesnames\"", pos);
+        if (sn != std::string::npos && sn < pos + 1200) {
+            size_t arr = json.find('[', sn);
+            size_t endarr = json.find(']', arr);
+            if (arr != std::string::npos && endarr != std::string::npos) {
+                std::string names = json.substr(arr, endarr - arr);
+                p.has_blake2b = names.find(BLAKE2B_FLAG) != std::string::npos;
+                p.has_rdts    = names.find(RDTS_FLAG) != std::string::npos;
+            }
+        }
+        out.push_back(p);
+        pos = q2 + 1;
+    }
+    return out;
+}
+
+static std::string rpc_call(const NodeConfig& n, const std::string& method,
+                             const std::string& params_json = "[]") {
+    std::string auth;
+    if (!n.cookie_path.empty()) {
+        std::string cookie = read_cookie(n.cookie_path);
+        if (!cookie.empty()) auth = "Basic " + base64_encode(cookie);
+    }
+    if (auth.empty() && !n.rpcuser.empty())
+        auth = "Basic " + base64_encode(n.rpcuser + ":" + n.rpcpassword);
+    if (auth.empty()) return "";
+
+    std::string body = "{\"jsonrpc\":\"1.0\",\"id\":\"scanner\",\"method\":\"" +
+                       method + "\",\"params\":" + params_json + "}";
+    return http_post(n.host, n.port, auth, body);
+}
+
+static void apply_ban(const NodeConfig& n, const std::string& ip) {
+    if (shm->dry_run.load() || shm->parse_mismatch.load()) return;
+    std::string params = "[\"" + ip + "\",\"add\"," + std::to_string(BAN_SECONDS) + ",false]";
+    rpc_call(n, "setban", params);
+    rpc_call(n, "disconnectnode", "[\"" + ip + "\"]");
+}
+
+static void ensure_keep_and_inject(const NodeConfig& n) {
+    auto do_add = [&](const std::string& peer) {
+        std::string p = peer;
+        if (p.find(':') == std::string::npos) p += ":8333";
+        rpc_call(n, "addnode", "[\"" + p + "\",\"add\"]");
+        rpc_call(n, "addnode", "[\"" + p + "\",\"onetry\"]");
+    };
+    for (const auto& k : n.keep_peers) do_add(k);
+    for (const auto& i : n.inject_peers) do_add(i);
+}
+
+// =============================================================================
+// Scanner
+// =============================================================================
+static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
+    while (running.load() && scanner_generation.load() == gen) {
+        std::string peer_resp = rpc_call(cfg, "getpeerinfo");
+        std::string net_resp  = rpc_call(cfg, "getnetworkinfo");
+        std::vector<PeerInfo> peers;
+        std::string err;
+        int reported_connections = -1;
+
+        if (peer_resp.empty()) {
+            err = "RPC failed";
+        } else {
+            peers = parse_peers(peer_resp);
+        }
+
+        // extract connections from getnetworkinfo
+        if (!net_resp.empty()) {
+            size_t p = net_resp.find("\"connections\"");
+            if (p != std::string::npos) {
+                p = net_resp.find(':', p);
+                if (p != std::string::npos) {
+                    reported_connections = std::atoi(net_resp.c_str() + p + 1);
+                }
+            }
+        }
+
+        bool mismatch = false;
+        if (reported_connections >= 0 && (int)peers.size() != reported_connections) {
+            mismatch = true;
+            err = "peer count mismatch (" + std::to_string(peers.size()) +
+                  " parsed vs " + std::to_string(reported_connections) + " reported)";
+        }
+        shm->parse_mismatch.store(mismatch);
+
+        int banned = 0;
+        for (auto& p : peers) {
+            bool is_keep = false;
+            for (const auto& k : cfg.keep_peers) {
+                std::string kip = k;
+                auto c = kip.rfind(':');
+                if (c != std::string::npos) kip = kip.substr(0, c);
+                if (std::string(p.ip) == kip) { is_keep = true; break; }
+            }
+            if (is_keep) continue;
+
+            bool should_ban = false;
+            if (cfg.enforce_blake2b && !p.has_blake2b) should_ban = true;
+            if (cfg.enforce_bip110 && !p.has_blake2b && !p.has_rdts) should_ban = true;
+
+            if (should_ban) {
+                p.banned = true;
+                banned++;
+                apply_ban(cfg, p.ip);
+            }
+        }
+        ensure_keep_and_inject(cfg);
+
+        pthread_mutex_lock(&shm->mutex);
+        NodeState& st = shm->nodes[node_idx];
+        strncpy(st.name, cfg.name.c_str(), sizeof(st.name)-1);
+        st.peer_count = std::min((int)peers.size(), MAX_PEERS_PER_NODE);
+        for (int i = 0; i < st.peer_count; ++i) st.peers[i] = peers[i];
+        st.banned_count = banned;
+        strncpy(st.last_error, err.c_str(), sizeof(st.last_error)-1);
+        pthread_mutex_unlock(&shm->mutex);
+
+        for (int i = 0; i < SCAN_INTERVAL_SEC && running.load() && scanner_generation.load() == gen; ++i)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+// =============================================================================
+// Config watcher (live reload + dry interlock)
+// =============================================================================
+static void config_watcher(const std::string& path) {
+    struct stat st{};
+    time_t last_sec = 0;
+    long last_nsec = 0;
+
+    if (stat(path.c_str(), &st) == 0) {
+        last_sec = st.st_mtim.tv_sec;
+        last_nsec = st.st_mtim.tv_nsec;
+    }
+
+    while (running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        if (stat(path.c_str(), &st) != 0) continue;
+
+        if (st.st_mtim.tv_sec == last_sec && st.st_mtim.tv_nsec == last_nsec) continue;
+
+        std::cout << "[CONFIG] " << path << " changed, validating...\n";
+
+        std::string err;
+        std::vector<NodeConfig> backup = NODES;
+        bool ok = load_config(path, err);
+
+        pthread_mutex_lock(&shm->mutex);
+        if (!ok) {
+            strncpy(shm->config_error, err.c_str(), sizeof(shm->config_error)-1);
+            shm->config_error[sizeof(shm->config_error)-1] = '\0';
+            NODES = std::move(backup); // restore
+            std::cerr << "[CONFIG] REJECTED: " << err << " (staying on previous config)\n";
+        } else {
+            shm->config_error[0] = '\0';
+            shm->node_count = (int)NODES.size();
+            // Dry interlock: force dry-run on any successful reload
+            shm->dry_run.store(true);
+            save_dry_run();
+            std::cout << "[CONFIG] RELOADED " << NODES.size() << " node(s). Forced DRY-RUN. Restarting scanners.\n";
+            pthread_mutex_unlock(&shm->mutex);
+            start_scanners();
+            pthread_mutex_lock(&shm->mutex);
+        }
+        pthread_mutex_unlock(&shm->mutex);
+
+        last_sec = st.st_mtim.tv_sec;
+        last_nsec = st.st_mtim.tv_nsec;
+    }
+}
+
+// =============================================================================
+int main(int argc, char** argv) {
+    std::string cfg_path = (argc > 1) ? argv[1] : CONFIG_FILE;
+
+    std::string init_err;
+    if (!load_config(cfg_path, init_err)) {
+        std::cerr << "Initial config failed: " << init_err << "\n";
+        return 1;
+    }
+
+    int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) { perror("shm_open"); return 1; }
+    if (ftruncate(fd, sizeof(SharedState)) < 0) { perror("ftruncate"); return 1; }
+    shm = (SharedState*)mmap(nullptr, sizeof(SharedState), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (shm == MAP_FAILED) { perror("mmap"); return 1; }
+    close(fd);
+
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&shm->mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+
+    shm->node_count = (int)NODES.size();
+    shm->daemon_running.store(true);
+    shm->parse_mismatch.store(false);
+    shm->fidget.store(0);
+    shm->config_error[0] = '\0';
+    strncpy(shm->config_path, cfg_path.c_str(), sizeof(shm->config_path)-1);
+    load_dry_run();
+
+    std::vector<std::thread> threads;
+    start_scanners();
+
+    std::thread watcher(config_watcher, cfg_path);
+
+    std::cout << "Daemon running. Shared memory: " << SHM_NAME << "\n";
+    std::cout << "Nodes: " << NODES.size() << "  Dry-run: " << (shm->dry_run.load() ? "ON" : "OFF") << "\n";
+    std::cout << "Start peer_display to view. Ctrl+C to stop.\n";
+
+    while (running.load()) {
+        shm->daemon_running.store(true);
+        shm->fidget.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    running.store(false);
+    shm->daemon_running.store(false);
+    save_dry_run();
+    for (auto& t : scanner_threads) if (t.joinable()) t.join();
+    if (watcher.joinable()) watcher.join();
+
+    munmap(shm, sizeof(SharedState));
+    return 0;
+}

@@ -1,0 +1,24 @@
+{
+  "nodes": [
+    {
+      "name": "blake2b",
+      "host": "127.0.0.1",
+      "port": 8332,
+      "cookie_path": "/var/lib/bitcoin/blake2b-data/.cookie",
+      "keep_peers": ["192.168.1.100:8333", "192.168.1.101"],
+      "inject_peers": ["10.0.0.5:8333"],
+      "enforce_blake2b": true,
+      "enforce_bip110": false
+    },
+    {
+      "name": "bip110sha256d",
+      "host": "127.0.0.1",
+      "port": 8334,
+      "cookie_path": "/var/lib/bitcoin/bip110-data/.cookie",
+      "keep_peers": ["192.168.1.102:8333"],
+      "inject_peers": [],
+      "enforce_blake2b": false,
+      "enforce_bip110": true
+    }
+  ]
+}
