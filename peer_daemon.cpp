@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <unistd.h>
+#include "git_version.h"
 #include <vector>
 #include <algorithm>
 #include <map>
@@ -53,6 +54,8 @@ struct NodeState {
     PeerInfo peers[MAX_PEERS_PER_NODE];
     int peer_count;
     int banned_count;
+    int blocks_height;
+    int headers_height;
     char last_error[64];
 };
 
@@ -170,13 +173,31 @@ static void update_tracking(std::vector<PeerInfo>& peers, const std::string& raw
         t.connected_seconds += SCAN_INTERVAL_SEC;
         t.last_seen_scan = scan_counter;
         t.last_addr = p.addr;
+        // write full peer JSON object to a side file for the display
         size_t pos = raw_json.find(std::string("\"addr\":\"") + p.addr);
         if (pos != std::string::npos) {
-            // extract the peer object roughly
             size_t obj_start = raw_json.rfind('{', pos);
-            size_t obj_end = raw_json.find('}', pos);
-            if (obj_start != std::string::npos && obj_end != std::string::npos && obj_end > obj_start)
+            int depth = 0;
+            size_t obj_end = obj_start;
+            bool in_str = false;
+            for (; obj_end < raw_json.size(); ++obj_end) {
+                char c = raw_json[obj_end];
+                if (c == '"' && (obj_end == 0 || raw_json[obj_end-1] != '\\')) in_str = !in_str;
+                if (in_str) continue;
+                if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) break;
+                }
+            }
+            if (obj_start != std::string::npos && obj_end < raw_json.size()) {
                 t.latest_json = raw_json.substr(obj_start, obj_end - obj_start + 1);
+                // also write a per-peer file the display can read
+                std::string safe = p.ip;
+                for (char& ch : safe) if (ch == ':' || ch == '/' || ch == '\\') ch = '_';
+                std::ofstream jf(std::string("peer_json_") + safe + ".txt");
+                if (jf) jf << t.latest_json;
+            }
             size_t ann = raw_json.find("\"last_block_announcement\"", pos);
             if (ann != std::string::npos && ann < pos + 2000) {
                 size_t colon = raw_json.find(':', ann);
@@ -218,7 +239,18 @@ static void write_csv() {
 }
 static const char* BLAKE2B_FLAG = "BLAKE2B?";
 static const char* RDTS_FLAG    = "REDUCED_DATA?";
+static const int RDTS_HEIGHT = 961632;
+static const int BLAKE2B_HEIGHT = 961640;
 static const int BAN_SECONDS = 86400 * 7;
+static const int MIN_PEERS_IBD = 8;
+
+static int extract_chain_height(const std::string& json, const char* key) {
+    size_t p = json.find(std::string("\"") + key + "\"");
+    if (p == std::string::npos) return -1;
+    p = json.find(':', p);
+    if (p == std::string::npos) return -1;
+    return std::atoi(json.c_str() + p + 1);
+}
 
 // =============================================================================
 // Minimal JSON config loader
@@ -581,14 +613,22 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
     while (running.load() && scanner_generation.load() == gen) {
         std::string peer_resp = rpc_call(cfg, "getpeerinfo");
         std::string net_resp  = rpc_call(cfg, "getnetworkinfo");
+        std::string chain_resp = rpc_call(cfg, "getblockchaininfo");
         std::vector<PeerInfo> peers;
         std::string err;
         int reported_connections = -1;
+        int blocks_height = -1;
+        int headers_height = -1;
 
         if (peer_resp.empty()) {
             err = "RPC failed";
         } else {
             peers = parse_peers(peer_resp);
+        }
+
+        if (!chain_resp.empty()) {
+            blocks_height = extract_chain_height(chain_resp, "blocks");
+            headers_height = extract_chain_height(chain_resp, "headers");
         }
 
         // extract connections from getnetworkinfo
@@ -611,6 +651,8 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
         shm->parse_mismatch.store(mismatch);
 
         int banned = 0;
+        int total = (int)peers.size();
+        int banned_this_pass = 0;
         for (auto& p : peers) {
             bool is_keep = false;
             for (const auto& k : cfg.keep_peers) {
@@ -631,12 +673,38 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
             if (is_keep || is_inject) continue;
 
             bool should_ban = false;
-            if (cfg.enforce_blake2b && !p.has_blake2b) should_ban = true;
-            if (cfg.enforce_bip110 && !p.has_blake2b && !p.has_rdts) should_ban = true;
+            int sync_h = (blocks_height >= 0) ? blocks_height : headers_height;
+            bool in_ibd = (sync_h < RDTS_HEIGHT) || (headers_height > 0 && blocks_height >= 0 && blocks_height + 10 < headers_height);
+
+            if (cfg.enforce_blake2b) {
+                if (sync_h < RDTS_HEIGHT) {
+                    int non_blake = 0;
+                    for (const auto& q : peers) if (!q.has_blake2b) non_blake++;
+                    if (!p.has_blake2b && non_blake > total / 2)
+                        should_ban = true;
+                } else if (sync_h < BLAKE2B_HEIGHT) {
+                    if (!p.has_blake2b) should_ban = true;
+                } else {
+                    if (!p.has_blake2b) should_ban = true;
+                }
+            } else if (cfg.enforce_bip110) {
+                if (sync_h < RDTS_HEIGHT) {
+                    // pre-RDTS: do not ban
+                } else {
+                    if (!p.has_blake2b && !p.has_rdts) should_ban = true;
+                }
+            }
+
+            // IBD floor: never ban below MIN_PEERS_IBD
+            if (should_ban && in_ibd) {
+                int remaining = total - banned_this_pass - 1;
+                if (remaining < MIN_PEERS_IBD) should_ban = false;
+            }
 
             if (should_ban) {
                 p.banned = true;
                 banned++;
+                banned_this_pass++;
                 apply_ban(cfg, p.ip);
             }
         }
@@ -649,6 +717,8 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
         NodeState& st = shm->nodes[node_idx];
         strncpy(st.name, cfg.name.c_str(), sizeof(st.name)-1);
         st.peer_count = std::min((int)peers.size(), MAX_PEERS_PER_NODE);
+        st.blocks_height = blocks_height;
+        st.headers_height = headers_height;
         for (int i = 0; i < st.peer_count; ++i) st.peers[i] = peers[i];
         st.banned_count = banned;
         strncpy(st.last_error, err.c_str(), sizeof(st.last_error)-1);
@@ -752,6 +822,7 @@ int main(int argc, char** argv) {
 
     std::thread watcher(config_watcher, cfg_path);
 
+    std::cout << "Bitcoin Peer Scanner " << GIT_COMMIT_HASH << "\n";
     std::cout << "Daemon running. Shared memory: " << SHM_NAME << "\n";
     std::cout << "Nodes: " << NODES.size() << "  Dry-run: " << (shm->dry_run.load() ? "ON" : "OFF") << "\n";
     std::cout << "Start peer_display to view. Ctrl+C to stop.\n";

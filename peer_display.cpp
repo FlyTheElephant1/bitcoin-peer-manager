@@ -15,14 +15,17 @@
 #include <pthread.h>
 #include <thread>
 #include <unistd.h>
+#include "git_version.h"
 #include <string>
 #include <vector>
-#include <algorithm>
+#include <csignal>
+#include <cstdlib>
 #include <iomanip>
 #include <sstream>
 
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/screen.hpp>
+#include <ftxui/screen/terminal.hpp>
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
@@ -51,6 +54,8 @@ struct NodeState {
     PeerInfo peers[MAX_PEERS_PER_NODE];
     int peer_count;
     int banned_count;
+    int blocks_height;
+    int headers_height;
     char last_error[64];
 };
 
@@ -71,10 +76,29 @@ static SharedState* shm = nullptr;
 static int page = 0;          // 0 = all nodes, 1..N = single node
 static int scroll_offset = 0;
 static bool justify = true;
-static int highlight = 0;     // index in the currently visible peer list
+static int highlight = 0;
 static bool show_history = false;
-static std::string filter;    // live filter term
+static std::string filter;
 static bool filter_mode = false;
+static int term_rows = 40;   // updated from screen size
+
+static void restore_terminal() {
+    // Disable mouse tracking modes that FTXUI enables
+    std::cout << "\033[?1000l"   // disable mouse click tracking
+              << "\033[?1002l"   // disable mouse button event tracking
+              << "\033[?1003l"   // disable all motion tracking
+              << "\033[?1006l"   // disable SGR mouse mode
+              << "\033[?1015l"   // disable urxvt mouse mode
+              << "\033[?25h"     // show cursor
+              << "\033[0 q"      // reset cursor shape
+              << "\033[?1049l"   // leave alternate screen
+              << std::flush;
+}
+
+static void on_signal(int) {
+    restore_terminal();
+    std::_Exit(1);
+}
 
 static void save_dry_run() {
     if (!shm) return;
@@ -91,14 +115,59 @@ static Element flag_element(const char* label, bool supported, bool force_green)
 static std::string pad_addr(const std::string& addr) {
     std::string s = addr;
     if (s.size() > 21) s = s.substr(0, 21);
-    s.resize(22, ' ');  // 22nd always blank
+    s.resize(22, ' ');
     return s;
+}
+
+static std::string pretty_json(const std::string& raw, int wrap = 36) {
+    std::string out;
+    int indent = 0;
+    bool in_str = false;
+    std::string line;
+    auto flush = [&]() {
+        if (!line.empty()) {
+            out += std::string(indent, ' ') + line + '\n';
+            line.clear();
+        }
+    };
+    for (size_t i = 0; i < raw.size(); ++i) {
+        char c = raw[i];
+        if (c == '"' && (i == 0 || raw[i-1] != '\\')) in_str = !in_str;
+        if (!in_str) {
+            if (c == '{' || c == '[') {
+                flush();
+                out += std::string(indent, ' ') + c + '\n';
+                indent++;
+                continue;
+            }
+            if (c == '}' || c == ']') {
+                flush();
+                indent = std::max(0, indent - 1);
+                out += std::string(indent, ' ') + c;
+                if (i + 1 < raw.size() && raw[i+1] == ',') { out += ','; ++i; }
+                out += '\n';
+                continue;
+            }
+            if (c == ',') {
+                line += c;
+                flush();
+                continue;
+            }
+            if (c == ':') { line += c; line += ' '; continue; }
+            if (c == ' ' || c == '\n' || c == '\t' || c == '\r') continue;
+        }
+        line += c;
+        if ((int)line.size() >= wrap - indent) flush();
+    }
+    flush();
+    return out;
 }
 
 static Element render_ui() {
     if (!shm) return text("No shared memory") | color(Color::Red);
 
-    Elements content;
+    Elements header;
+    Elements body;
     bool dry = shm->dry_run.load();
     bool mismatch = shm->parse_mismatch.load();
 
@@ -112,9 +181,9 @@ static Element render_ui() {
     }
     bool daemon_up = (now - last_change) < std::chrono::seconds(3);
 
-    content.push_back(
+    header.push_back(
         hbox({
-            text("Bitcoin Peer Display") | bold,
+            text("Bitcoin Peer Display " GIT_COMMIT_HASH) | bold,
             text("  |  "),
             text(dry ? "DRY-RUN" : "LIVE") | bold | color(dry ? Color::Yellow : Color::Red),
             text(mismatch ? "  [PARSE MISMATCH]" : "  [COUNT OK]") | bold | color(mismatch ? Color::Red : Color::Green),
@@ -122,53 +191,52 @@ static Element render_ui() {
             text("   [Ctrl+R] dry  [←→] page  [↑↓] select  [TAB] justify  [Ctrl+H] hist  [Ctrl+F] filter  [q] quit") | dim
         })
     );
-    content.push_back(text("BLAKE2B → both green   |   RDTS → green   |   neither → red   |   score = first-responder / 100 blocks"));
+    header.push_back(text("BLAKE2B → both green   |   RDTS → green   |   neither → red   |   score = first-responder / 100 blocks"));
     if (shm->config_error[0]) {
-        content.push_back(text(std::string("CONFIG ERROR: ") + shm->config_error) | bold | color(Color::Red));
+        header.push_back(text(std::string("CONFIG ERROR: ") + shm->config_error) | bold | color(Color::Red));
     }
-    content.push_back(separator());
+    header.push_back(separator());
 
     pthread_mutex_lock(&shm->mutex);
     int nnodes = shm->node_count;
     if (nnodes < 1) nnodes = 0;
-
-    // Clamp page
     if (page < 0) page = 0;
     if (page > nnodes) page = 0;
 
     std::string page_title = (page == 0) ? "ALL NODES" : shm->nodes[page - 1].name;
-    content.push_back(text("Page: " + page_title +
-                           (filter_mode ? "  FILTER: " + filter : "") +
-                           (show_history ? "  [HISTORY]" : "") +
-                           "  (justify " + (justify ? "ON" : "OFF") + ")") | dim);
+    Element filter_line = text("Page: " + page_title + "  filter: " + (filter.empty() ? "(none)" : filter) +
+                               (justify ? "  justify:ON" : "  justify:OFF"));
+    header.push_back(filter_mode ? (filter_line | color(Color::Yellow) | bold)
+                                 : (filter_line | dim));
+    if (show_history) header.push_back(text("[HISTORY MODE]") | bold | color(Color::Magenta));
 
     std::vector<const PeerInfo*> visible_peers;
+    int selected_body_line = -1;
     auto render_node = [&](int n) {
         const NodeState& st = shm->nodes[n];
-        content.push_back(text(std::string("=== ") + st.name + " ===") | bold | color(Color::Cyan));
-
+        body.push_back(text(std::string("=== ") + st.name + " ===") | bold | color(Color::Cyan));
         if (st.last_error[0]) {
-            content.push_back(text(std::string("  ") + st.last_error) | color(Color::Red));
+            body.push_back(text(std::string("  ") + st.last_error) | color(Color::Red));
             return;
         }
-
-        content.push_back(text("  peers=" + std::to_string(st.peer_count) +
-                               "  banned_this_scan=" + std::to_string(st.banned_count)));
-
+        body.push_back(text("  peers=" + std::to_string(st.peer_count) +
+                            "  banned_this_scan=" + std::to_string(st.banned_count) +
+                            "  blocks=" + std::to_string(st.blocks_height) +
+                            "  headers=" + std::to_string(st.headers_height)));
         std::vector<const PeerInfo*> sorted;
         for (int i = 0; i < st.peer_count; ++i) sorted.push_back(&st.peers[i]);
-        std::stable_sort(sorted.begin(), sorted.end(), [](const PeerInfo* a, const PeerInfo* b) {
+        std::sort(sorted.begin(), sorted.end(), [](const PeerInfo* a, const PeerInfo* b) {
             if (a->is_inject != b->is_inject) return a->is_inject > b->is_inject;
             if (a->is_keep != b->is_keep) return a->is_keep > b->is_keep;
             return a->score_per_100 > b->score_per_100;
         });
-
         for (const PeerInfo* pp : sorted) {
             const PeerInfo& p = *pp;
             if (!filter.empty() && std::string(p.addr).find(filter) == std::string::npos &&
                 std::string(p.ip).find(filter) == std::string::npos) continue;
             visible_peers.push_back(pp);
             bool selected = ((int)visible_peers.size() - 1 == highlight);
+            if (selected) selected_body_line = (int)body.size();
             bool force_rdts = p.has_blake2b;
             std::string addr_disp = justify ? pad_addr(p.addr) : (std::string(p.addr) + "  ");
             Elements row = {
@@ -186,15 +254,27 @@ static Element render_ui() {
             row.push_back(text(scorebuf) | dim);
             Element line = hbox(std::move(row));
             if (selected) line = line | inverted;
-            content.push_back(line);
+            body.push_back(line);
         }
-        content.push_back(text(""));
+        body.push_back(text(""));
     };
 
-    if (show_history && page > 0) {
-        content.push_back(text("=== HISTORY (from peers.db) ===") | bold | color(Color::Magenta));
-        content.push_back(text("  (full history written to peers.db every 60s)"));
-        content.push_back(text("  Select a live peer to see its tracked stats on the right."));
+    if (show_history) {
+        body.push_back(text("=== HISTORY (peers.db) ===") | bold | color(Color::Magenta));
+        std::ifstream db("peers.db");
+        if (db) {
+            std::string line;
+            int shown = 0;
+            while (std::getline(db, line) && shown < 200) {
+                if (line.empty() || line[0] == '#') continue;
+                if (!filter.empty() && line.find(filter) == std::string::npos) continue;
+                body.push_back(text("  " + line) | dim);
+                shown++;
+            }
+            if (shown == 0) body.push_back(text("  (no matching history)") | dim);
+        } else {
+            body.push_back(text("  (peers.db not found)") | color(Color::Red));
+        }
     } else if (page == 0) {
         for (int n = 0; n < nnodes && n < MAX_NODES; ++n) render_node(n);
     } else if (page >= 1 && page <= nnodes) {
@@ -204,7 +284,23 @@ static Element render_ui() {
 
     if (highlight >= (int)visible_peers.size()) highlight = std::max(0, (int)visible_peers.size() - 1);
 
-    Elements left = content;
+    int header_h = (int)header.size();
+    int body_view = std::max(5, term_rows - header_h - 2);
+    if (selected_body_line >= 0) {
+        if (selected_body_line < scroll_offset)
+            scroll_offset = selected_body_line;
+        else if (selected_body_line >= scroll_offset + body_view)
+            scroll_offset = selected_body_line - body_view + 1;
+    }
+    int max_scroll = std::max(0, (int)body.size() - body_view);
+    if (scroll_offset > max_scroll) scroll_offset = max_scroll;
+    if (scroll_offset < 0) scroll_offset = 0;
+
+    Elements body_vis;
+    for (int i = scroll_offset; i < (int)body.size() && (int)body_vis.size() < body_view; ++i)
+        body_vis.push_back(body[i]);
+    if (body_vis.empty()) body_vis.push_back(text("(empty)"));
+
     Elements right;
     if (!visible_peers.empty() && highlight >= 0 && highlight < (int)visible_peers.size()) {
         const PeerInfo& sel = *visible_peers[highlight];
@@ -218,24 +314,36 @@ static Element render_ui() {
         char sb[32]; snprintf(sb, sizeof(sb), "score/100:  %.2f", sel.score_per_100);
         right.push_back(text(sb));
         right.push_back(separator());
-        right.push_back(text("(full JSON in peers.db)") | dim);
+        std::string safe = sel.ip;
+        for (char& ch : safe) if (ch == ':' || ch == '/' || ch == '\\') ch = '_';
+        std::ifstream jf(std::string("peer_json_") + safe + ".txt");
+        if (jf) {
+            std::stringstream ss; ss << jf.rdbuf();
+            std::string pretty = pretty_json(ss.str(), 36);
+            std::istringstream ls(pretty);
+            std::string ln;
+            while (std::getline(ls, ln)) right.push_back(text(ln) | dim);
+        } else {
+            right.push_back(text("(JSON not yet written)") | dim);
+        }
     } else {
         right.push_back(text("No peer selected") | dim);
     }
 
-    // Apply scroll to left
-    Elements left_vis;
-    int start = std::max(0, scroll_offset);
-    for (size_t i = start; i < left.size(); ++i) left_vis.push_back(left[i]);
-    if (left_vis.empty()) left_vis.push_back(text("(empty)"));
+    Elements left;
+    left.insert(left.end(), header.begin(), header.end());
+    left.insert(left.end(), body_vis.begin(), body_vis.end());
 
     return hbox({
-        vbox(std::move(left_vis)) | flex | border,
+        vbox(std::move(left)) | flex | border,
         vbox(std::move(right)) | size(WIDTH, EQUAL, 40) | border
     });
 }
 
 int main() {
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
     int fd = shm_open(SHM_NAME, O_RDWR, 0666);
     if (fd < 0) {
         std::cerr << "Cannot open shared memory. Is peer_daemon running?\n";
@@ -249,7 +357,11 @@ int main() {
     }
 
     auto screen = ScreenInteractive::Fullscreen();
-    auto component = Renderer([&] { return render_ui(); });
+    auto component = Renderer([&] {
+        auto sz = Terminal::Size();
+        if (sz.dimy > 0) term_rows = sz.dimy;
+        return render_ui();
+    });
 
     std::atomic<bool> display_running{true};
     std::thread refresher([&] {
@@ -281,8 +393,31 @@ int main() {
             highlight++;
             return true;
         }
+        if (event == Event::PageUp) {
+            int step = std::max(1, term_rows - 8);
+            highlight = std::max(0, highlight - step);
+            return true;
+        }
+        if (event == Event::PageDown) {
+            int step = std::max(1, term_rows - 8);
+            highlight += step;
+            return true;
+        }
+        if (event == Event::Home) {
+            highlight = 0;
+            scroll_offset = 0;
+            return true;
+        }
+        if (event == Event::End) {
+            highlight = 100000;  // clamped in render
+            return true;
+        }
         if (event == Event::Special("\x08") || event == Event::Character('\x08')) { // Ctrl+H
-            show_history = !show_history;
+            if (filter_mode) {
+                if (!filter.empty()) filter.pop_back();
+            } else {
+                show_history = !show_history;
+            }
             return true;
         }
         if (event == Event::Special("\x06") || event == Event::Character('\x06')) { // Ctrl+F
@@ -290,11 +425,17 @@ int main() {
             if (!filter_mode) filter.clear();
             return true;
         }
-        if (filter_mode && event.is_character()) {
-            if (event == Event::Backspace && !filter.empty()) filter.pop_back();
-            else if (event.character().size() == 1 && event.character()[0] >= 32)
+        if (filter_mode) {
+            if (event == Event::Backspace || event == Event::Delete ||
+                event == Event::Character('\x7f') || event == Event::Character('\b') ||
+                (event.is_character() && (event.character() == "\x7f" || event.character() == "\b"))) {
+                if (!filter.empty()) filter.pop_back();
+                return true;
+            }
+            if (event.is_character() && event.character().size() == 1 && event.character()[0] >= 32) {
                 filter += event.character();
-            return true;
+                return true;
+            }
         }
         if (event == Event::ArrowLeft) {
             pthread_mutex_lock(&shm->mutex);
@@ -334,7 +475,7 @@ int main() {
     display_running.store(false);
     if (refresher.joinable()) refresher.join();
 
-    std::cout << "\033[?25h\033[0 q\033[?1049l" << std::flush;
+    restore_terminal();
     munmap(shm, sizeof(SharedState));
     return 0;
 }
