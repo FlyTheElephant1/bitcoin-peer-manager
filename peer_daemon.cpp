@@ -35,6 +35,7 @@ static const int MAX_PEERS_PER_NODE = 128;
 static const int MAX_NODES = 32;
 static const char* SHM_NAME = "/bitcoin_peer_scanner_shm";
 static const char* STATE_FILE = "dry_run.state";
+static const char* HASH_FILE  = "last_githash.state";
 static const char* CONFIG_FILE = "config.json";
 
 struct PeerInfo {
@@ -127,6 +128,12 @@ struct PeerTrack {
     std::string latest_json;   // most recent getpeerinfo object for this peer
     std::string last_addr;
 };
+static std::string peer_key(const PeerInfo& p) {
+    // Key by full address (ip:port) so 127.0.0.1:8333 and 127.0.0.1:8334 are distinct
+    std::string k = p.addr[0] ? p.addr : p.ip;
+    for (char& ch : k) if (ch == ':' || ch == '/' || ch == '\\' || ch == '[' || ch == ']') ch = '_';
+    return k;
+}
 static std::map<std::string, PeerTrack> peer_registry;
 static std::mutex registry_mutex;
 static uint32_t scan_counter = 0;
@@ -159,9 +166,9 @@ static void save_peer_db() {
     std::lock_guard<std::mutex> lock(registry_mutex);
     std::ofstream f(PEER_DB, std::ios::trunc);
     if (!f) return;
-    f << "# ip|first_resp|conn_sec|last_announcement|last_addr\n";
-    for (const auto& [ip, t] : peer_registry) {
-        f << ip << '|' << t.first_responder_count << '|' << t.connected_seconds
+    f << "# key|first_resp|conn_sec|last_announcement|last_addr\n";
+    for (const auto& [key, t] : peer_registry) {
+        f << key << '|' << t.first_responder_count << '|' << t.connected_seconds
           << '|' << t.last_block_announcement << '|' << t.last_addr << '\n';
     }
 }
@@ -170,7 +177,7 @@ static void update_tracking(std::vector<PeerInfo>& peers, const std::string& raw
     std::lock_guard<std::mutex> lock(registry_mutex);
     scan_counter++;
     for (auto& p : peers) {
-        auto& t = peer_registry[p.ip];
+        auto& t = peer_registry[peer_key(p)];
         t.connected_seconds += SCAN_INTERVAL_SEC;
         t.last_seen_scan = scan_counter;
         t.last_addr = p.addr;
@@ -193,9 +200,7 @@ static void update_tracking(std::vector<PeerInfo>& peers, const std::string& raw
             }
             if (obj_start != std::string::npos && obj_end < raw_json.size()) {
                 t.latest_json = raw_json.substr(obj_start, obj_end - obj_start + 1);
-                // also write a per-peer file the display can read
-                std::string safe = p.ip;
-                for (char& ch : safe) if (ch == ':' || ch == '/' || ch == '\\') ch = '_';
+                std::string safe = peer_key(p);
                 std::ofstream jf(std::string("peer_json_") + safe + ".txt");
                 if (jf) jf << t.latest_json;
             }
@@ -466,6 +471,7 @@ static bool load_config(const std::string& path, std::string& error_out) {
 // =============================================================================
 // Dry-run file helpers
 // =============================================================================
+static void save_dry_run();
 static void load_dry_run() {
     std::ifstream f(STATE_FILE);
     if (!f) {
@@ -475,6 +481,23 @@ static void load_dry_run() {
     int v = 1;
     f >> v;
     shm->dry_run.store(v != 0);
+}
+
+static void check_githash_and_force_dry() {
+    std::string prev;
+    {
+        std::ifstream f(HASH_FILE);
+        if (f) std::getline(f, prev);
+    }
+    std::string cur = GIT_COMMIT_HASH;
+    if (prev != cur) {
+        shm->dry_run.store(true);
+        save_dry_run();
+        std::cout << "[SAFETY] Git hash changed (" << (prev.empty() ? "none" : prev)
+                  << " -> " << cur << "). Forced DRY-RUN.\n";
+    }
+    std::ofstream out(HASH_FILE, std::ios::trunc);
+    if (out) out << cur << "\n";
 }
 
 static void save_dry_run() {
@@ -587,13 +610,17 @@ static std::vector<PeerInfo> parse_peers(const std::string& json) {
 
         // servicesnames must appear soon after this addr
         size_t sn = json.find("\"servicesnames\"", pos);
-        if (sn != std::string::npos && sn < pos + 4000) {
+        if (sn != std::string::npos && sn < pos + 8000) {
             size_t arr = json.find('[', sn);
             size_t endarr = json.find(']', arr);
             if (arr != std::string::npos && endarr != std::string::npos) {
                 std::string names = json.substr(arr, endarr - arr);
-                p.has_blake2b = names.find(BLAKE2B_FLAG) != std::string::npos;
-                p.has_rdts    = names.find(RDTS_FLAG) != std::string::npos;
+                bool bit28 = names.find("2^28") != std::string::npos ||
+                             names.find("268435456") != std::string::npos;
+                bool bit27 = names.find("2^27") != std::string::npos ||
+                             names.find("134217728") != std::string::npos;
+                p.has_blake2b = names.find(BLAKE2B_FLAG) != std::string::npos || bit28;
+                p.has_rdts    = names.find(RDTS_FLAG) != std::string::npos || bit27 || bit28;
             }
         }
         out.push_back(p);
@@ -618,27 +645,36 @@ static std::string rpc_call(const NodeConfig& n, const std::string& method,
     return http_post(n.host, n.port, auth, body);
 }
 
-static void apply_ban(const NodeConfig& n, const std::string& ip) {
+static void apply_ban(const NodeConfig& n, const std::string& addr) {
     if (shm->dry_run.load() || shm->parse_mismatch.load()) return;
-    // setban accepts onion and i2p addresses (no port) on modern Knots/Core
-    std::string params = "[\"" + ip + "\",\"add\"," + std::to_string(BAN_SECONDS) + ",false]";
-    rpc_call(n, "setban", params);
-    rpc_call(n, "disconnectnode", "[\"" + ip + "\"]");
+    // disconnect only — setban is IP-wide and breaks multi-node hosts
+    rpc_call(n, "disconnectnode", "[\"" + addr + "\"]");
 }
 
 static void ensure_keep_and_inject(const NodeConfig& n, const std::vector<PeerInfo>& current) {
     auto already = [&](const std::string& peer) {
-        std::string norm = normalize_addr(peer);
-        for (const auto& p : current)
-            if (normalize_addr(p.addr) == norm || normalize_addr(p.ip) == norm) return true;
+        for (const auto& p : current) {
+            if (normalize_addr(p.addr) != normalize_addr(peer)) continue;
+            if (normalize_addr(peer) == "127.0.0.1" || normalize_addr(peer) == "::1") {
+                auto pc = std::string(p.addr).rfind(':');
+                auto ic = peer.rfind(':');
+                if (pc != std::string::npos && ic != std::string::npos &&
+                    std::string(p.addr).substr(pc) == peer.substr(ic)) return true;
+            } else {
+                return true;
+            }
+        }
         return false;
     };
     auto do_add = [&](const std::string& peer) {
+        // only addnode entries that have an explicit port
+        if (peer.find(':') == std::string::npos) return;
         if (already(peer)) return;
-        std::string p = peer;
-        if (p.find(':') == std::string::npos) p += ":8333";
-        rpc_call(n, "addnode", "[\"" + p + "\",\"add\"]");
-        rpc_call(n, "addnode", "[\"" + p + "\",\"onetry\"]");
+        std::string host = normalize_addr(peer);
+        rpc_call(n, "setban", "[\"" + host + "\",\"remove\"]");
+        rpc_call(n, "addnode", "[\"" + peer + "\",\"add\"]");
+        rpc_call(n, "addnode", "[\"" + peer + "\",\"onetry\"]");
+        std::cout << "[INJECT] " << n.name << " addnode " << peer << "\n";
     };
     for (const auto& k : n.keep_peers) do_add(k);
     for (const auto& i : n.inject_peers) do_add(i);
@@ -694,17 +730,37 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
         for (auto& p : peers) {
             bool is_keep = false;
             for (const auto& k : cfg.keep_peers) {
-                if (normalize_addr(std::string(p.ip)) == normalize_addr(k) ||
-                    normalize_addr(std::string(p.addr)) == normalize_addr(k)) {
+                std::string pa = p.addr, ka = k;
+                if (normalize_addr(pa) != normalize_addr(ka)) continue;
+                // localhost: match if ports equal, or config has no port, or peer is on 8333
+                if (normalize_addr(pa) == "127.0.0.1" || normalize_addr(pa) == "::1") {
+                    auto pc = pa.rfind(':'), kc = ka.rfind(':');
+                    bool port_ok = (kc == std::string::npos) ||
+                                   (pc != std::string::npos && pa.substr(pc) == ka.substr(kc)) ||
+                                   (pc != std::string::npos && pa.substr(pc) == ":8333");
+                    if (port_ok) { is_keep = true; break; }
+                } else {
                     is_keep = true; break;
                 }
             }
             bool is_inject = false;
             for (const auto& inj : cfg.inject_peers) {
-                if (normalize_addr(std::string(p.ip)) == normalize_addr(inj) ||
-                    normalize_addr(std::string(p.addr)) == normalize_addr(inj)) {
+                std::string pa = p.addr, ia = inj;
+                if (normalize_addr(pa) != normalize_addr(ia)) continue;
+                if (normalize_addr(pa) == "127.0.0.1" || normalize_addr(pa) == "::1") {
+                    auto pc = pa.rfind(':'), ic = ia.rfind(':');
+                    bool port_ok = (ic == std::string::npos) ||
+                                   (pc != std::string::npos && pa.substr(pc) == ia.substr(ic)) ||
+                                   (pc != std::string::npos && pa.substr(pc) == ":8333");
+                    if (port_ok) { is_inject = true; break; }
+                } else {
                     is_inject = true; break;
                 }
+            }
+            if (!is_keep && !is_inject &&
+                (normalize_addr(p.addr) == "127.0.0.1" || normalize_addr(p.addr) == "::1")) {
+                std::cout << "[LOCAL] " << cfg.name << " peer " << p.addr
+                          << " not in keep/inject, may ban\n";
             }
             p.is_keep = is_keep;
             p.is_inject = is_inject;
@@ -743,7 +799,7 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
                 p.banned = true;
                 banned++;
                 banned_this_pass++;
-                apply_ban(cfg, p.ip);
+                apply_ban(cfg, p.addr);
             }
         }
         ensure_keep_and_inject(cfg, peers);
@@ -846,6 +902,7 @@ int main(int argc, char** argv) {
     shm->config_error[0] = '\0';
     strncpy(shm->config_path, cfg_path.c_str(), sizeof(shm->config_path)-1);
     load_dry_run();
+    check_githash_and_force_dry();
     load_peer_db();
 
     std::thread db_saver([] {
@@ -863,6 +920,13 @@ int main(int argc, char** argv) {
     std::cout << "Bitcoin Peer Scanner " << GIT_COMMIT_HASH << "\n";
     std::cout << "Daemon running. Shared memory: " << SHM_NAME << "\n";
     std::cout << "Nodes: " << NODES.size() << "  Dry-run: " << (shm->dry_run.load() ? "ON" : "OFF") << "\n";
+    for (const auto& n : NODES) {
+        std::cout << "  " << n.name << " keep=[";
+        for (size_t i = 0; i < n.keep_peers.size(); ++i) std::cout << (i?",":"") << n.keep_peers[i];
+        std::cout << "] inject=[";
+        for (size_t i = 0; i < n.inject_peers.size(); ++i) std::cout << (i?",":"") << n.inject_peers[i];
+        std::cout << "]\n";
+    }
     std::cout << "Start peer_display to view. Ctrl+C to stop.\n";
 
     while (running.load()) {
