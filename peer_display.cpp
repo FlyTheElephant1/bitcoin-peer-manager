@@ -39,6 +39,7 @@ static const char* STATE_FILE = "dry_run.state";
 struct PeerInfo {
     char addr[96];
     char ip[80];
+    int nodeid;
     bool has_blake2b;
     bool has_rdts;
     bool banned;
@@ -314,8 +315,8 @@ static Element render_ui() {
         char sb[32]; snprintf(sb, sizeof(sb), "score/100:  %.2f", sel.score_per_100);
         right.push_back(text(sb));
         right.push_back(separator());
-        std::string safe = sel.ip;
-        for (char& ch : safe) if (ch == ':' || ch == '/' || ch == '\\') ch = '_';
+        std::string safe = sel.addr[0] ? sel.addr : sel.ip;
+        for (char& ch : safe) if (ch == ':' || ch == '/' || ch == '\\' || ch == '[' || ch == ']') ch = '_';
         std::ifstream jf(std::string("peer_json_") + safe + ".txt");
         if (jf) {
             std::stringstream ss; ss << jf.rdbuf();
