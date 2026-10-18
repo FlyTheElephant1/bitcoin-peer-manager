@@ -37,8 +37,8 @@ static const char* SHM_NAME = "/bitcoin_peer_scanner_shm";
 static const char* STATE_FILE = "dry_run.state";
 
 struct PeerInfo {
-    char addr[64];
-    char ip[46];
+    char addr[96];
+    char ip[80];
     bool has_blake2b;
     bool has_rdts;
     bool banned;

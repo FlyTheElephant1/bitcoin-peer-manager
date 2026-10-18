@@ -23,6 +23,7 @@
 #include "git_version.h"
 #include <vector>
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -37,8 +38,8 @@ static const char* STATE_FILE = "dry_run.state";
 static const char* CONFIG_FILE = "config.json";
 
 struct PeerInfo {
-    char addr[64];
-    char ip[46];
+    char addr[96];
+    char ip[80];
     bool has_blake2b;
     bool has_rdts;
     bool banned;
@@ -236,6 +237,44 @@ static void write_csv() {
         f << ip << " # score=" << score << " first_resp=" << t.first_responder_count
           << " conn_sec=" << t.connected_seconds << "\n";
     }
+}
+// Normalize an address for matching: strip port, return canonical host.
+// Handles IPv4, [IPv6]:port, IPv6:port, onion, i2p, hostnames.
+static std::string normalize_addr(const std::string& raw) {
+    std::string s = raw;
+    // strip trailing port if present
+    if (s.size() > 2 && s[0] == '[') {
+        auto end = s.find(']');
+        if (end != std::string::npos) return s.substr(1, end - 1);
+    }
+    // onion / i2p / hostname: last colon separates port
+    if (s.find(".onion") != std::string::npos || s.find(".i2p") != std::string::npos ||
+        s.find('.') != std::string::npos) {
+        auto c = s.rfind(':');
+        if (c != std::string::npos && c > 0 && std::isdigit(s[c+1]))
+            return s.substr(0, c);
+        return s;
+    }
+    // bare IPv6 (contains multiple colons, no brackets)
+    if (std::count(s.begin(), s.end(), ':') > 1) {
+        // if last segment looks like a port (numeric, short), strip it
+        auto c = s.rfind(':');
+        if (c != std::string::npos) {
+            std::string tail = s.substr(c + 1);
+            if (tail.size() <= 5 && !tail.empty() &&
+                std::all_of(tail.begin(), tail.end(), ::isdigit))
+                return s.substr(0, c);
+        }
+        return s;
+    }
+    // IPv4:port
+    auto c = s.rfind(':');
+    if (c != std::string::npos) return s.substr(0, c);
+    return s;
+}
+
+static bool is_onion_or_i2p(const std::string& addr) {
+    return addr.find(".onion") != std::string::npos || addr.find(".i2p") != std::string::npos;
 }
 static const char* BLAKE2B_FLAG = "BLAKE2B?";
 static const char* RDTS_FLAG    = "REDUCED_DATA?";
@@ -543,16 +582,7 @@ static std::vector<PeerInfo> parse_peers(const std::string& json) {
 
         PeerInfo p{};
         strncpy(p.addr, addr.c_str(), sizeof(p.addr)-1);
-        std::string ip = addr;
-        auto c = ip.rfind(':');
-        if (c != std::string::npos) {
-            if (ip[0] == '[') {
-                auto end = ip.find(']');
-                if (end != std::string::npos) ip = ip.substr(1, end - 1);
-            } else {
-                ip = ip.substr(0, c);
-            }
-        }
+        std::string ip = normalize_addr(addr);
         strncpy(p.ip, ip.c_str(), sizeof(p.ip)-1);
 
         // servicesnames must appear soon after this addr
@@ -590,13 +620,21 @@ static std::string rpc_call(const NodeConfig& n, const std::string& method,
 
 static void apply_ban(const NodeConfig& n, const std::string& ip) {
     if (shm->dry_run.load() || shm->parse_mismatch.load()) return;
+    // setban accepts onion and i2p addresses (no port) on modern Knots/Core
     std::string params = "[\"" + ip + "\",\"add\"," + std::to_string(BAN_SECONDS) + ",false]";
     rpc_call(n, "setban", params);
     rpc_call(n, "disconnectnode", "[\"" + ip + "\"]");
 }
 
-static void ensure_keep_and_inject(const NodeConfig& n) {
+static void ensure_keep_and_inject(const NodeConfig& n, const std::vector<PeerInfo>& current) {
+    auto already = [&](const std::string& peer) {
+        std::string norm = normalize_addr(peer);
+        for (const auto& p : current)
+            if (normalize_addr(p.addr) == norm || normalize_addr(p.ip) == norm) return true;
+        return false;
+    };
     auto do_add = [&](const std::string& peer) {
+        if (already(peer)) return;
         std::string p = peer;
         if (p.find(':') == std::string::npos) p += ":8333";
         rpc_call(n, "addnode", "[\"" + p + "\",\"add\"]");
@@ -656,17 +694,17 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
         for (auto& p : peers) {
             bool is_keep = false;
             for (const auto& k : cfg.keep_peers) {
-                std::string kip = k;
-                auto c = kip.rfind(':');
-                if (c != std::string::npos) kip = kip.substr(0, c);
-                if (std::string(p.ip) == kip) { is_keep = true; break; }
+                if (normalize_addr(std::string(p.ip)) == normalize_addr(k) ||
+                    normalize_addr(std::string(p.addr)) == normalize_addr(k)) {
+                    is_keep = true; break;
+                }
             }
             bool is_inject = false;
             for (const auto& inj : cfg.inject_peers) {
-                std::string iip = inj;
-                auto c = iip.rfind(':');
-                if (c != std::string::npos) iip = iip.substr(0, c);
-                if (std::string(p.ip) == iip) { is_inject = true; break; }
+                if (normalize_addr(std::string(p.ip)) == normalize_addr(inj) ||
+                    normalize_addr(std::string(p.addr)) == normalize_addr(inj)) {
+                    is_inject = true; break;
+                }
             }
             p.is_keep = is_keep;
             p.is_inject = is_inject;
@@ -708,7 +746,7 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
                 apply_ban(cfg, p.ip);
             }
         }
-        ensure_keep_and_inject(cfg);
+        ensure_keep_and_inject(cfg, peers);
 
         update_tracking(peers, peer_resp);
         if (scan_counter % 10 == 0) write_csv();
