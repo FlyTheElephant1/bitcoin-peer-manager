@@ -396,6 +396,9 @@ int main() {
 
     std::atomic<bool> display_running{true};
     std::thread refresher([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // disable any-motion tracking, keep click + wheel
+        std::cout << "\033[?1003l\033[?1000h\033[?1006h" << std::flush;
         while (display_running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             if (shm && shm->dirty.load())
@@ -507,6 +510,8 @@ int main() {
         }
         if (event.is_mouse()) {
             auto& m = event.mouse();
+            // drop pure motion (no button) immediately
+            if (m.button == Mouse::None) return true;
             if (m.button == Mouse::WheelUp) {
                 scroll_offset = std::max(0, scroll_offset - 3);
                 return true;
