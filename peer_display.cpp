@@ -67,6 +67,7 @@ struct SharedState {
     std::atomic<bool> parse_mismatch;
     std::atomic<bool> daemon_running;
     std::atomic<uint32_t> fidget;
+    std::atomic<bool> dirty;
     int node_count;
     NodeState nodes[MAX_NODES];
     char config_error[128];
@@ -174,6 +175,7 @@ static std::string pretty_json(const std::string& raw, int wrap = 36) {
 
 static Element render_ui() {
     if (!shm) return text("No shared memory") | color(Color::Red);
+    shm->dirty.store(false);
 
     Elements header;
     Elements body;
@@ -395,8 +397,9 @@ int main() {
     std::atomic<bool> display_running{true};
     std::thread refresher([&] {
         while (display_running.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            screen.PostEvent(Event::Custom);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (shm && shm->dirty.load())
+                screen.PostEvent(Event::Custom);
         }
     });
 

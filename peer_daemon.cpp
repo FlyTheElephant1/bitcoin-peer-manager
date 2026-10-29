@@ -69,6 +69,7 @@ struct SharedState {
     std::atomic<bool> parse_mismatch;
     std::atomic<bool> daemon_running;
     std::atomic<uint32_t> fidget;   // incremented every second by daemon
+    std::atomic<bool> dirty;        // set when peer data changes
     int node_count;
     NodeState nodes[MAX_NODES];
     char config_error[128];
@@ -900,6 +901,7 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
         st.banned_count = banned;
         strncpy(st.last_error, err.c_str(), sizeof(st.last_error)-1);
         pthread_mutex_unlock(&shm->mutex);
+        shm->dirty.store(true);
 
         for (int i = 0; i < SCAN_INTERVAL_SEC && running.load() && scanner_generation.load() == gen; ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -982,6 +984,7 @@ int main(int argc, char** argv) {
     shm->daemon_running.store(true);
     shm->parse_mismatch.store(false);
     shm->fidget.store(0);
+    shm->dirty.store(true);
     shm->config_error[0] = '\0';
     strncpy(shm->config_path, cfg_path.c_str(), sizeof(shm->config_path)-1);
     load_dry_run();
