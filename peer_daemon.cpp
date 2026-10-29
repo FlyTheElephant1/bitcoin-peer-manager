@@ -31,7 +31,7 @@
 // =============================================================================
 // Shared memory layout
 // =============================================================================
-static const int MAX_PEERS_PER_NODE = 128;
+static const int MAX_PEERS_PER_NODE = 512;
 static const int MAX_NODES = 32;
 static const char* SHM_NAME = "/bitcoin_peer_scanner_shm";
 static const char* STATE_FILE = "dry_run.state";
@@ -138,7 +138,55 @@ static std::string peer_key(const PeerInfo& p) {
 static std::map<std::string, PeerTrack> peer_registry;
 static std::mutex registry_mutex;
 static uint32_t scan_counter = 0;
+// Extract a port from an address string
+static std::string normalize_addr(const std::string& raw);
 static const char* PEER_DB = "peers.db";
+
+static std::string port_of(const std::string& addr) {
+    auto c = addr.rfind(':');
+    return (c != std::string::npos) ? addr.substr(c+1) : "";
+}
+
+// True if two nodes have complementary 127.0.0.1 connections
+// (A sees addr:X addrbind:Y, B sees addr:Y addrbind:X)
+static bool is_mutual_local(const std::string& addr, const std::string& raw_json, int my_idx) {
+    std::string my_port = port_of(addr);
+    if (my_port.empty()) return false;
+    // find addrbind or addrlocal near this peer in the JSON
+    size_t pos = raw_json.find(std::string("\"addr\":\"") + addr);
+    std::string bind_port;
+    if (pos != std::string::npos) {
+        for (const char* key : {"\"addrbind\"", "\"addrlocal\""}) {
+            size_t bp = raw_json.find(key, pos);
+            if (bp != std::string::npos && bp < pos + 500) {
+                size_t q1 = raw_json.find('"', bp + strlen(key) + 1);
+                size_t q2 = (q1 != std::string::npos) ? raw_json.find('"', q1+1) : std::string::npos;
+                if (q1 != std::string::npos && q2 != std::string::npos)
+                    bind_port = port_of(raw_json.substr(q1+1, q2-q1-1));
+                if (!bind_port.empty()) break;
+            }
+        }
+    }
+    if (bind_port.empty()) return false;
+    // check other nodes for the reverse pair
+    pthread_mutex_lock(&shm->mutex);
+    for (int n = 0; n < shm->node_count && n < MAX_NODES; ++n) {
+        if (n == my_idx) continue;
+        for (int i = 0; i < shm->nodes[n].peer_count; ++i) {
+            const auto& op = shm->nodes[n].peers[i];
+            if (normalize_addr(op.addr) != "127.0.0.1" && normalize_addr(op.addr) != "::1") continue;
+            if (port_of(op.addr) == bind_port) {
+                pthread_mutex_unlock(&shm->mutex);
+                return true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&shm->mutex);
+    return false;
+}
+
+// grace counter for non-mutual 127.0.0.1 peers (keyed by addr)
+static std::map<std::string, int> local_grace;
 
 static void load_peer_db() {
     std::ifstream f(PEER_DB);
@@ -771,8 +819,20 @@ static void scanner_thread(NodeConfig cfg, int node_idx, int gen) {
             }
             if (!is_keep && !is_inject &&
                 (normalize_addr(p.addr) == "127.0.0.1" || normalize_addr(p.addr) == "::1")) {
-                std::cout << "[LOCAL] " << cfg.name << " peer " << p.addr
-                          << " not in keep/inject, may ban\n";
+                if (is_mutual_local(p.addr, peer_resp, node_idx)) {
+                    is_keep = true;  // mutual internal pair
+                } else {
+                    int& g = local_grace[p.addr];
+                    g++;
+                    if (g < 3) {
+                        is_keep = true;  // grace period
+                        std::cout << "[LOCAL] " << cfg.name << " " << p.addr
+                                  << " grace " << g << "/3\n";
+                    } else {
+                        std::cout << "[LOCAL] " << cfg.name << " " << p.addr
+                                  << " not mutual, applying rules\n";
+                    }
+                }
             }
             p.is_keep = is_keep;
             p.is_inject = is_inject;

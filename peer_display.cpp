@@ -31,7 +31,7 @@
 
 using namespace ftxui;
 
-static const int MAX_PEERS_PER_NODE = 128;
+static const int MAX_PEERS_PER_NODE = 512;
 static const int MAX_NODES = 32;
 static const char* SHM_NAME = "/bitcoin_peer_scanner_shm";
 static const char* STATE_FILE = "dry_run.state";
@@ -78,10 +78,15 @@ static int page = 0;          // 0 = all nodes, 1..N = single node
 static int scroll_offset = 0;
 static bool justify = true;
 static int highlight = 0;
+static std::string selected_addr;
+static int selected_node = -1;
 static bool show_history = false;
 static std::string filter;
 static bool filter_mode = false;
-static int term_rows = 40;   // updated from screen size
+static int term_rows = 40;
+static int last_header_h = 5;
+static std::vector<int> peer_body_lines;
+static std::vector<int> peer_nodes;
 
 static void restore_terminal() {
     // Disable mouse tracking modes that FTXUI enables
@@ -213,6 +218,8 @@ static Element render_ui() {
 
     std::vector<const PeerInfo*> visible_peers;
     int selected_body_line = -1;
+    peer_body_lines.clear();
+    peer_nodes.clear();
     auto render_node = [&](int n) {
         const NodeState& st = shm->nodes[n];
         body.push_back(text(std::string("=== ") + st.name + " ===") | bold | color(Color::Cyan));
@@ -236,8 +243,16 @@ static Element render_ui() {
             if (!filter.empty() && std::string(p.addr).find(filter) == std::string::npos &&
                 std::string(p.ip).find(filter) == std::string::npos) continue;
             visible_peers.push_back(pp);
-            bool selected = ((int)visible_peers.size() - 1 == highlight);
-            if (selected) selected_body_line = (int)body.size();
+            peer_body_lines.push_back((int)body.size());
+            peer_nodes.push_back(n);
+            bool selected = (!selected_addr.empty() && std::string(p.addr) == selected_addr &&
+                             (selected_node < 0 || selected_node == n)) ||
+                            (selected_addr.empty() && (int)visible_peers.size() - 1 == highlight);
+            if (selected) {
+                highlight = (int)visible_peers.size() - 1;
+                selected_node = n;
+                selected_body_line = (int)body.size();
+            }
             bool force_rdts = p.has_blake2b;
             std::string addr_disp = justify ? pad_addr(p.addr) : (std::string(p.addr) + "  ");
             Elements row = {
@@ -284,8 +299,13 @@ static Element render_ui() {
     pthread_mutex_unlock(&shm->mutex);
 
     if (highlight >= (int)visible_peers.size()) highlight = std::max(0, (int)visible_peers.size() - 1);
+    if (highlight >= 0 && highlight < (int)visible_peers.size()) {
+        selected_addr = visible_peers[highlight]->addr;
+        if (highlight < (int)peer_nodes.size()) selected_node = peer_nodes[highlight];
+    }
 
     int header_h = (int)header.size();
+    last_header_h = header_h;
     int body_view = std::max(5, term_rows - header_h - 2);
     if (selected_body_line >= 0) {
         if (selected_body_line < scroll_offset)
@@ -388,29 +408,41 @@ int main() {
         }
         if (event == Event::ArrowUp) {
             highlight = std::max(0, highlight - 1);
+            selected_addr.clear();
+            selected_node = -1;
             return true;
         }
         if (event == Event::ArrowDown) {
             highlight++;
+            selected_addr.clear();
+            selected_node = -1;
             return true;
         }
         if (event == Event::PageUp) {
             int step = std::max(1, term_rows - 8);
             highlight = std::max(0, highlight - step);
+            selected_addr.clear();
+            selected_node = -1;
             return true;
         }
         if (event == Event::PageDown) {
             int step = std::max(1, term_rows - 8);
             highlight += step;
+            selected_addr.clear();
+            selected_node = -1;
             return true;
         }
         if (event == Event::Home) {
             highlight = 0;
             scroll_offset = 0;
+            selected_addr.clear();
+            selected_node = -1;
             return true;
         }
         if (event == Event::End) {
-            highlight = 100000;  // clamped in render
+            highlight = 100000;
+            selected_addr.clear();
+            selected_node = -1;
             return true;
         }
         if (event == Event::Special("\x08") || event == Event::Character('\x08')) { // Ctrl+H
@@ -467,6 +499,21 @@ int main() {
             if (m.button == Mouse::WheelDown) {
                 scroll_offset += 3;
                 return true;
+            }
+            if (m.button == Mouse::Left && m.motion == Mouse::Pressed) {
+                int body_line = scroll_offset + (m.y - last_header_h - 1);
+                // find the peer whose body line is closest to the click
+                int best = -1, best_dist = 999;
+                for (int i = 0; i < (int)peer_body_lines.size(); ++i) {
+                    int d = std::abs(peer_body_lines[i] - body_line);
+                    if (d < best_dist) { best_dist = d; best = i; }
+                }
+                if (best >= 0 && best_dist <= 1) {
+                    highlight = best;
+                    selected_addr.clear();
+                    selected_node = -1;
+                    return true;
+                }
             }
         }
         return false;
