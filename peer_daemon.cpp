@@ -47,6 +47,7 @@ struct PeerInfo {
     bool banned;
     bool is_keep;
     bool is_inject;
+    char subver[20];
     uint32_t first_responder_count;
     uint32_t connected_seconds;
     float score_per_100;
@@ -677,6 +678,16 @@ static std::vector<PeerInfo> parse_peers(const std::string& json) {
                              names.find("134217728") != std::string::npos;
                 p.has_blake2b = names.find(BLAKE2B_FLAG) != std::string::npos || bit28;
                 p.has_rdts    = names.find(RDTS_FLAG) != std::string::npos || bit27 || bit28;
+            }
+        }
+        // extract subver near this addr
+        size_t sv = json.find("\"subver\"", pos);
+        if (sv != std::string::npos && sv < pos + 8000) {
+            size_t q1 = json.find('"', sv + 8);
+            size_t q2 = (q1 != std::string::npos) ? json.find('"', q1+1) : std::string::npos;
+            if (q1 != std::string::npos && q2 != std::string::npos) {
+                std::string s = json.substr(q1+1, std::min((size_t)16, q2-q1-1));
+                strncpy(p.subver, s.c_str(), sizeof(p.subver)-1);
             }
         }
         out.push_back(p);

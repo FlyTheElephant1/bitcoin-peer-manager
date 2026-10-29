@@ -45,6 +45,7 @@ struct PeerInfo {
     bool banned;
     bool is_keep;
     bool is_inject;
+    char subver[20];
     uint32_t first_responder_count;
     uint32_t connected_seconds;
     float score_per_100;   // first responders per 100 blocks
@@ -84,6 +85,8 @@ static bool show_history = false;
 static std::string filter;
 static bool filter_mode = false;
 static int term_rows = 40;
+static int sort_mode = 0;  // 0=score, 1=subver, 2=address
+static const char* sort_names[] = {"score", "subver", "address"};
 static int last_header_h = 5;
 static std::vector<int> peer_body_lines;
 static std::vector<int> peer_nodes;
@@ -194,7 +197,7 @@ static Element render_ui() {
             text(dry ? "DRY-RUN" : "LIVE") | bold | color(dry ? Color::Yellow : Color::Red),
             text(mismatch ? "  [PARSE MISMATCH]" : "  [COUNT OK]") | bold | color(mismatch ? Color::Red : Color::Green),
             text(daemon_up ? "  [daemon OK]" : "  [daemon DOWN]") | color(daemon_up ? Color::Green : Color::Red),
-            text("   [Ctrl+R] dry  [←→] page  [↑↓] select  [TAB] justify  [Ctrl+H] hist  [Ctrl+F] filter  [q] quit") | dim
+            text("   [Ctrl+R] dry  [←→] page  [↑↓] select  [TAB] justify  [s] sort  [Ctrl+H] hist  [Ctrl+F] filter  [q] quit") | dim
         })
     );
     header.push_back(text("BLAKE2B → both green   |   RDTS → green   |   neither → red   |   score = first-responder / 100 blocks"));
@@ -211,7 +214,8 @@ static Element render_ui() {
 
     std::string page_title = (page == 0) ? "ALL NODES" : shm->nodes[page - 1].name;
     Element filter_line = text("Page: " + page_title + "  filter: " + (filter.empty() ? "(none)" : filter) +
-                               (justify ? "  justify:ON" : "  justify:OFF"));
+                               (justify ? "  justify:ON" : "  justify:OFF") +
+                               "  sort:" + sort_names[sort_mode]);
     header.push_back(filter_mode ? (filter_line | color(Color::Yellow) | bold)
                                  : (filter_line | dim));
     if (show_history) header.push_back(text("[HISTORY MODE]") | bold | color(Color::Magenta));
@@ -236,6 +240,8 @@ static Element render_ui() {
         std::sort(sorted.begin(), sorted.end(), [](const PeerInfo* a, const PeerInfo* b) {
             if (a->is_inject != b->is_inject) return a->is_inject > b->is_inject;
             if (a->is_keep != b->is_keep) return a->is_keep > b->is_keep;
+            if (sort_mode == 1) return std::string(a->subver) < std::string(b->subver);
+            if (sort_mode == 2) return std::string(a->addr) < std::string(b->addr);
             return a->score_per_100 > b->score_per_100;
         });
         for (const PeerInfo* pp : sorted) {
@@ -260,6 +266,8 @@ static Element render_ui() {
                 flag_element("BLAKE2B", p.has_blake2b, false),
                 text(" "),
                 flag_element("RDTS", p.has_rdts, force_rdts),
+                text(" "),
+                text(std::string(p.subver).substr(0, 16)) | dim,
             };
             if (p.is_inject) row.push_back(text(" [INJECT]") | color(Color::Cyan));
             else if (p.is_keep) row.push_back(text(" [KEEP]") | color(Color::Yellow));
@@ -306,14 +314,14 @@ static Element render_ui() {
 
     int header_h = (int)header.size();
     last_header_h = header_h;
-    int body_view = std::max(5, term_rows - header_h - 2);
+    int body_view = std::max(5, term_rows - header_h - 4);
     if (selected_body_line >= 0) {
         if (selected_body_line < scroll_offset)
             scroll_offset = selected_body_line;
         else if (selected_body_line >= scroll_offset + body_view)
             scroll_offset = selected_body_line - body_view + 1;
     }
-    int max_scroll = std::max(0, (int)body.size() - body_view);
+    int max_scroll = std::max(0, (int)body.size() - body_view + 2);
     if (scroll_offset > max_scroll) scroll_offset = max_scroll;
     if (scroll_offset < 0) scroll_offset = 0;
 
@@ -484,6 +492,10 @@ int main() {
             pthread_mutex_unlock(&shm->mutex);
             page = (page + 1) % (n + 1);
             scroll_offset = 0;
+            return true;
+        }
+        if (event == Event::Character('s') || event == Event::Character('S')) {
+            sort_mode = (sort_mode + 1) % 3;
             return true;
         }
         if (event == Event::Tab) {
